@@ -14,7 +14,7 @@
 #### 快速安装:
 `git clone https://github.com/xmdevops/simple_http_paser` \
 `cd simple_http_paser` \
-`python setup.py install` \
+`python setup.py install` 
 
 ***
 
