@@ -12,9 +12,9 @@
 ***
 
 #### 快速安装:
-`git clone https://github.com/xmdevops/simple_http_paser`
-`cd simple_http_paser`
-`python setup.py install`
+`git clone https://github.com/xmdevops/simple_http_paser` \
+`cd simple_http_paser` \
+`python setup.py install` \
 
 ***
 
@@ -34,8 +34,8 @@ import hashlib
 
 from threading import Thread
 from Queue import Queue, Empty
-from http_parser.http import HttpStream
-from http_parser.reader import SocketReader
+from simple_http_parser.http import HttpStream
+from simple_http_parser.reader import SocketReader
 
 
 class AsyncQThread(Thread):
