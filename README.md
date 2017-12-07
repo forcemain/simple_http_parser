@@ -1,6 +1,6 @@
 # simple_http_paser
 #### 简单介绍:
->[simple_http_paser](https://github.com/xmdevops/simple_http_paser) 主要用于解析Socket Http Response,优雅接收异步服务端粘包,兼容PY2.6+
+>[simple_http_paser](https://github.com/xmdevops/simple_http_paser) 主要用于解析Socket Http Response, 对异步服务端粘包优雅处理,兼容PY2.6+
 
 ***
 
