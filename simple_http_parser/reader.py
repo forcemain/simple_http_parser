@@ -6,7 +6,7 @@
 """
 
 
-from http_parser.socketio import SocketIO
+from simple_http_parser.socketio import SocketIO
 
 
 class SocketReader(SocketIO):

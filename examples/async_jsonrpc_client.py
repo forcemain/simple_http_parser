@@ -12,8 +12,8 @@ import hashlib
 
 from threading import Thread
 from Queue import Queue, Empty
-from http_parser.http import HttpStream
-from http_parser.reader import SocketReader
+from simple_http_parser.http import HttpStream
+from simple_http_parser.reader import SocketReader
 
 
 class AsyncQThread(Thread):
