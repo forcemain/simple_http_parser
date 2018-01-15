@@ -24,171 +24,212 @@
 
 
 import json
+import uuid
 import time
-import random
-import pprint
 import base64
 import socket
+import random
 import hashlib
+import logging
+import threading
 
 
-from threading import Thread
-from Queue import Queue, Empty
-from simple_http_parser.http import HttpStream
-from simple_http_parser.reader import SocketReader
+from agent.libs.p2p_jsonrpc.http import pack_post_data, unblock_mode_recv
 
 
-class AsyncQThread(Thread):
-    def __init__(self, cls, func, *args, **kwargs):
-        super(AsyncQThread, self).__init__()
-        self.cls = cls
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
+class State(object):
+    nonce = None
+    token = None
+    lock = threading.Lock()
+    connected = False
+    startrecv = False
 
-        self.result = []
-
-    def run(self):
-        self.result = self.func(*self.args, **self.kwargs)
-
-    def get_result(self):
-        return self.result
-
-
-def auto_refresh_token(func):
-    def wrapper(self, *args, **kwargs):
-        if self.token is None:
-            self.auth_login()
-        return func(self, *args, **kwargs)
-    return wrapper
+    @classmethod
+    def re_connect(cls, host, port):
+        cls.nonce = None
+        cls.token = None
+        cls.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cls.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        cls.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cls.sock.connect((host, port))
 
 
-class QueryEntrance(object):
-    MI = 1
-    MX = pow(2, 31)
+class Client(object):
+    _ins = None
+    _min = 1
+    _max = pow(2, 31)
 
-    __queuemap = {}
-    __instance = None
+    def __init__(self, *args, **kwargs):
+        # for debug, default is off
+        self.debug = kwargs.get('debug', False)
 
-    def __init__(self, host=None, port=None, username=None, password=None):
-        self.host = host
-        self.port = port
-        self.token = None
-        self.nonce = None
-        self.queue = Queue()
+        # for jsonrpc uri
+        self.juri = kwargs.get('juri', '/xmcloud/service')
 
-        self.username = username
-        self.password = password
+        # for filter and output
+        self.mark = kwargs.get('mark', 'default')
 
-        self.qsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # for output
+        self.queue = kwargs.get('queue')
 
-        self.dispatch()
+        # for state
+        self.state = State
 
-    # Single Case
+        # for nonce and token
+        self.username = kwargs.get('username')
+        self.password = kwargs.get('password')
+
+        # for conn json-rpc server
+        self.host = kwargs.get('host')
+        self.port = kwargs.get('port')
+
+        # unblocking send or recv
+        if not self.state.startrecv:
+            self.start()
+
     def __new__(cls, *args, **kwargs):
-        cls.__instance = cls.__instance or object.__new__(cls, *args, **kwargs)
+        cls._ins = cls._ins or super(Client, cls).__new__(cls, *args, **kwargs)
 
-        return cls.__instance
-
-    def __post(self, uri, **kwargs):
-        header_list = map(lambda s: '{0}: {1}'.format(s[0], s[1]), kwargs['headers'].iteritems())
-        post_nums = 0
-        limit_num = 3
-
-        post_data = [
-            'POST {0} HTTP/1.1'.format(uri),
-            '\r\n'.join(header_list),
-            '\r\n{0}'.format(kwargs['body'])
-        ]
-        while True:
-            try:
-                self.qsock.sendall('\r\n'.join(post_data))
-                break
-            except socket.error as e:
-                if post_nums > limit_num:
-                    print 'sendall with exception {0} times, failed, exp={1}'.format(limit_num, e)
-                    break
-                try:
-                    self.qsock.connect((self.host, self.port))
-                except socket.error:
-                    pass
-                # 断开连接重新获取Token
-                self.token = None
-            post_nums += 1
+        return cls._ins
 
     def __randomid(self):
-        pre_id = random.randint(self.__class__.MI, self.__class__.MX)
-        while True:
-            while True:
-                ntx_id = random.randint(self.__class__.MI, self.__class__.MX)
-                if ntx_id != pre_id:
-                    break
-            pre_id = ntx_id
-            yield ntx_id
+        request_id = random.randint(self.__class__._min, self.__class__._max)
+        session_id = '{0}_{1}'.format(uuid.uuid1().hex, request_id)
 
-    def __hex_md5s(self, md5):
+        return request_id, session_id
+
+    def __postdata(self, uri, **kwargs):
+        with self.state.lock:
+            if not self.state.connected:
+                self.state.re_connect(self.host, self.port)
+                self.state.connected = True
+        packed_data = pack_post_data(uri, **kwargs)
+        try:
+            self.state.sock.sendall(packed_data)
+        except socket.error as e:
+            self.state.connected = False
+
+    def __strs_md5(self, md5):
         hex_str_list = []
         for i in xrange(0, len(md5), 2):
-            i_hex = chr(int(md5[i: i+2], 16))
+            i_hex = chr(int(md5[i: i + 2], 16))
             hex_str_list.append(i_hex)
 
         return ''.join(hex_str_list)
 
-    def __enc_pass(self):
-        pass_str = '{0}{1}'.format(self.nonce, self.password)
+    def __encpasswd(self, nonce, passwd):
+        pass_str = '{0}{1}'.format(nonce, passwd)
         pass_md5 = hashlib.md5(pass_str).hexdigest()
-        pass_md5 = self.__hex_md5s(pass_md5)
+        pass_md5 = self.__strs_md5(pass_md5)
         pass_b64 = base64.b64encode(pass_md5)
 
         return pass_b64
 
-    def dispatch(self):
-        def update_queuemap():
+    def __validate(self, data):
+        required_rsp_fields = ['id', 'method', 'result']
+        is_valid = True
+
+        for field in required_rsp_fields:
+            if field not in data:
+                is_valid = False
+                break
+
+        return is_valid
+
+    def __auth_req_handler(self, data):
+        fmtdata = (self.__class__.__name__, self.__auth_req_handler.__name__, data)
+        self.debug and logging.debug('{0}.{1} recv data, data={2}'.format(*fmtdata))
+
+        auth_keys = ['nonce', 'token']
+        data_rets = data['result']
+        for key in auth_keys:
+            if key not in data_rets:
+                continue
+            setattr(self.state, key, data_rets[key])
+
+    def __domain_req_handler(self, data):
+        filter_data = {
+            'mark': self.mark,
+            'data': data,
+        }
+
+        fmtdata = (self.__class__.__name__, self.__domain_req_handler.__name__, filter_data)
+        self.debug and logging.debug('{0}.{1} recv data, data={2}'.format(*fmtdata))
+
+        self.queue.put(filter_data)
+
+    def __node_req_handler(self, data):
+        filter_data = {
+            'mark': self.mark,
+            'data': data
+        }
+
+        fmtdata = (self.__class__.__name__, self.__node_req_handler.__name__, filter_data)
+        self.debug and logging.debug('{0}.{1} recv data, data={2}'.format(*fmtdata))
+
+        self.queue.put(filter_data)
+
+    def __dispatch(self, data):
+        route_map = {
+            'xmcloud/service/login': self.__auth_req_handler,
+            'xmcloud/service/domain/stat': self.__domain_req_handler,
+            'xmcloud/service/node/stat': self.__node_req_handler,
+        }
+        fmtdata = (self.__class__.__name__, self.__dispatch.__name__, data)
+        if not self.__validate(data):
+            self.debug and logging.error('{0}.{1} recived invalid data, data={2}'.format(*fmtdata))
+            return
+        handler = route_map.get(data['method'], None)
+        if handler is None:
+            self.debug and logging.error('{0}.{1} can not found handler, data={2}'.format(*fmtdata))
+            return
+
+        handler(data)
+
+    def start(self):
+        def target():
             while True:
-                msg_sid, msg_len, msg_res = self.queue.get()
-                self.__class__.__queuemap.update({msg_sid: {'msg_len': msg_len, 'msg_res': msg_res}})
+                try:
+                    json_data = unblock_mode_recv(self.state.sock)
+                    dict_data = json.loads(json_data)
+                except (socket.error, AttributeError) as e:
+                    """
+                    AttributeError, maybe sock is not init
+                    socket.error, maybe connect is closed
+                    """
+                    fmtdata = (self.__class__.__name__,  e)
+                    self.debug and logging.error('{0} recv with exception, exp={1}'.format(*fmtdata))
+                    self.state.connected = False
+                    time.sleep(1)
+                    continue
+                except (TypeError, ValueError) as e:
+                    """
+                    TypeError, maybe json type error
+                    ValueError, maybe not json
+                    
+                    ignore, continue
+                    """
+                    fmtdata = (self.__class__.__name__, e)
+                    self.debug and logging.error('{0} recv with exception, exp={1}'.format(*fmtdata))
+                    time.sleep(1)
+                    continue
 
-        def consum_queuemap():
-            while True:
-                count = 0
-                while True:
-                    try:
-                        r = SocketReader(self.qsock)
-                        s = HttpStream(r)
-                        s.read(4096)
-                        json_data = s.body.next()
-                        print '=' * 100
-                        print json_data
-                        print '=' * 100
-                    except socket.error:
-                        continue
-                    try:
-                        dict_data = json.loads(json_data)
-                    except (TypeError, ValueError):
-                        # may be empty data.
-                        continue
+                self.__dispatch(dict_data)
+            # for recv thread stoped
+            self.state.startrecv = False
 
-                    count += 1
-                    sid = dict_data['id']
-                    sid_data = self.__class__.__queuemap[sid]
-
-                    sid_data['msg_res'].put(dict_data)
-                    if count == sid_data['msg_len']:
-                        break
-
-        p = Thread(target=update_queuemap)
-        p.setDaemon(True)
-        p.start()
-        c = Thread(target=consum_queuemap)
-        c.setDaemon(True)
-        c.start()
+        t = threading.Thread(target=target)
+        t.setDaemon(True)
+        t.start()
+        # for recv thread started
+        self.state.startrecv = True
 
     def auth_nonce(self):
-        method = 'xmcloud/service/login'
-        sid = self.__randomid().next()
-        url = '/{0}'.format(method)
+        method = '{0}/login'.format(self.juri.lstrip('/'))
+        request_id, session_id = self.__randomid()
+
         body = {
-            'id': sid,
+            'id': request_id,
             'jsonrpc': '2.0',
             'method': method,
             'params': {'username': self.username}
@@ -203,31 +244,20 @@ class QueryEntrance(object):
             'Content-Length': len(js_body),
         }
 
-        res = Queue()
-        self.queue.put((sid, 1, res))
-        self.__post(url, method='POST', headers=headers, body=js_body)
-
-        count = 0
-        while True:
-            count += 1
-            rec = res.get()
-            self.nonce = rec['result']['nonce']
-            if count == 1:
-                break
+        self.__postdata(self.juri, method='POST', headers=headers, body=js_body)
 
     def auth_login(self):
-        self.auth_nonce()
+        method = '{0}/login'.format(self.juri.lstrip('/'))
+        request_id, session_id = self.__randomid()
+        password_enc = self.__encpasswd(self.state.nonce, self.password)
 
-        method = 'xmcloud/service/login'
-        sid = self.__randomid().next()
-        url = '/{0}'.format(method)
         body = {
-            'id': sid,
+            'id': request_id,
             'jsonrpc': '2.0',
             'method': method,
             'params': {
                 'username': self.username,
-                'password': self.__enc_pass()
+                'password': password_enc
             }
         }
         js_body = json.dumps(body)
@@ -240,29 +270,17 @@ class QueryEntrance(object):
             'Content-Length': len(js_body),
         }
 
-        res = Queue()
-        self.queue.put((sid, 1, res))
-        self.__post(url, method='POST', headers=headers, body=js_body)
+        self.__postdata(self.juri, method='POST', headers=headers, body=js_body)
 
-        count = 0
-        while True:
-            count += 1
-            rec = res.get()
-            self.token = rec['result']['token']
-            if count == 1:
-                break
+    def query(self, method=None, params=None):
+        request_id, session_id = self.__randomid()
 
-    @auto_refresh_token
-    def query(self, params):
-        method = 'xmcloud/service/status/query'
-        sid = self.__randomid().next()
-        url = '/{0}'.format(method)
         body = {
-            'id': sid,
+            'id': request_id,
             'jsonrpc': '2.0',
-            'method': 'xmcloud/service/status/query',
+            'method': method,
             'params': params,
-            'token': self.token
+            'token': self.state.token
         }
         js_body = json.dumps(body)
         headers = {
@@ -274,75 +292,8 @@ class QueryEntrance(object):
             'Content-Length': len(js_body),
         }
 
-        res = Queue()
-        self.queue.put((sid, len(params), res))
-        self.__post(url, method='POST', headers=headers, body=js_body)
+        self.__postdata(self.juri, method='POST', headers=headers, body=js_body)
 
-        return [sid]
-
-    def query_one_with_one_mode(self, uuid, mode):
-        sid_list = []
-        params = [{'uuid': uuid, 'mode': mode, 'auth': ''}]
-        sid_list.extend(self.query(params))
-
-        return sid_list
-
-    def query_one_with_all_mode(self, uuid):
-        sid_list = []
-        modes = ['eznatv1', 'eznatv2', 'dss', 'rps', 'tps', '']
-        sid_list.extend(self.query_one_with_more_mode(uuid, *modes))
-
-        return sid_list
-
-    def query_one_with_more_mode(self, uuid, *modes):
-        sid_list = []
-        for mode in modes:
-            sid_list.extend(self.query_one_with_one_mode(uuid, mode))
-
-        return sid_list
-
-    def map(self, *sids):
-        rlist = []
-
-        def target(s_id):
-            count = 0
-            slist = []
-            if s_id not in self.__class__.__queuemap:
-                return slist
-            sid_data = self.__class__.__queuemap[s_id]
-            while True:
-                try:
-                    rec = sid_data['msg_res'].get(timeout=10)
-                    slist.append(rec)
-                    count += 1
-                    if count == sid_data['msg_len']:
-                        break
-                except Empty:
-                    break
-
-            return slist
-
-        tlist = []
-        for sid in sids:
-            t = AsyncQThread(self, target, sid)
-            tlist.append(t)
-            t.start()
-        for t in tlist:
-            t.join()
-        for t in tlist:
-            rlist.extend(t.get_result())
-
-        return rlist
-
-
-if __name__ == '__main__':
-    q = QueryEntrance(host='<host>', port=9355, username='<username>', password='<password>')
-    cur_time = time.time()
-    sid_list = q.query_one_with_all_mode('<uuid>')
-    pprint.pprint(q.map(*sid_list))
-    nxt_time = time.time()
-
-    print 'notice: used {0} seconds'.format(nxt_time-cur_time)
 ```
 ***
 
